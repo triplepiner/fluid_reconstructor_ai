@@ -295,16 +295,6 @@ fluid_ai/
 
 ## Citation
 
-If you use this code in your research, please cite:
-
-```bibtex
-@misc{fluid_reconstruction_2024,
-  title={Physics-Integrated Neural Fluid Reconstruction},
-  author={MBZUAI Research Team},
-  year={2024},
-  publisher={GitHub},
-}
-```
 
 ## License
 
