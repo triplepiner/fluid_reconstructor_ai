@@ -5,6 +5,7 @@ Each stage handles one step of the fluid reconstruction process.
 """
 
 import torch
+import numpy as np
 from typing import Any, Dict, Optional, List
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -143,36 +144,62 @@ class VideoLoadingStage(PipelineStage):
 
 
 class VideoStabilizationStage(PipelineStage):
-    """Stage 1a: Stabilize videos to handle camera shake."""
+    """Stage 1a: Stabilize videos to handle camera shake while preserving slow pans."""
 
     name = "video_stabilization"
-    description = "Stabilize videos and track camera motion"
+    description = "Stabilize videos (preserve slow pans) and track camera motion"
 
     def _execute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         from ..calibration import VideoStabilizer, CameraMotionEstimator
+        from ..calibration.camera_motion import StabilizationResult
 
         videos = inputs['videos']
 
         if not self.config.enable_stabilization and not self.config.track_camera_motion:
             print("    Skipping stabilization (disabled in config)")
-            return {'videos': videos, 'camera_trajectories': None}
+            return {'videos': videos, 'camera_trajectories': None, 'stabilization_results': None}
 
+        # Create stabilizer with slow pan preservation settings
         stabilizer = VideoStabilizer(
-            smoothing_radius=self.config.stabilization_smoothing
+            smoothing_radius=self.config.stabilization_smoothing,
+            preserve_slow_pan=self.config.preserve_slow_pan,
+            shake_frequency_cutoff=self.config.shake_frequency_cutoff,
+            min_pan_velocity=self.config.min_pan_velocity,
+            pan_smoothness_factor=self.config.pan_smoothness_factor,
+            start_frame=self.config.stabilization_start_frame,
+            end_frame=self.config.stabilization_end_frame,
+            edge_taper=self.config.stabilization_edge_taper
         )
         motion_estimator = CameraMotionEstimator()
 
         camera_trajectories = []
+        stabilization_results = []
 
         pbar = tqdm(videos, desc="    Processing videos", unit="video", leave=False)
         for video in pbar:
             pbar.set_postfix(file=video.metadata.path.name[:15])
 
+            stab_result = None
             if self.config.enable_stabilization:
-                # Stabilize frames to remove shake
-                stabilized_frames, _ = stabilizer.stabilize(video.frames)
-                video.frames = stabilized_frames
-                print(f"    Stabilized {video.metadata.path.name}")
+                # Stabilize frames with slow pan preservation
+                fps = video.metadata.fps
+                stab_result = stabilizer.stabilize_with_details(video.frames, fps)
+                video.frames = stab_result.stabilized_frames
+
+                # Report stabilization results
+                shake_magnitude = np.sqrt(
+                    stab_result.shake_removed[:, 0]**2 +
+                    stab_result.shake_removed[:, 1]**2
+                ).mean()
+                pan_magnitude = np.sqrt(
+                    stab_result.preserved_pan[:, 0]**2 +
+                    stab_result.preserved_pan[:, 1]**2
+                ).mean()
+
+                print(f"    Stabilized {video.metadata.path.name}: "
+                      f"shake={shake_magnitude:.2f}px, pan={pan_magnitude:.2f}px preserved")
+
+            stabilization_results.append(stab_result)
 
             if self.config.track_camera_motion:
                 # Track residual camera motion for later compensation
@@ -195,11 +222,20 @@ class VideoStabilizationStage(PipelineStage):
                     width=W, height=H
                 )
 
+                # If we have stabilization results, use the preserved pan to inform trajectory
                 trajectory = motion_estimator.estimate_trajectory(
                     video.frames,
                     base_camera,
                     video.timestamps
                 )
+
+                # Incorporate preserved pan motion into trajectory for accurate modeling
+                if stab_result is not None and self.config.preserve_slow_pan:
+                    trajectory = self._incorporate_preserved_pan(
+                        trajectory, stab_result.preserved_pan,
+                        base_camera, video.timestamps
+                    )
+
                 camera_trajectories.append(trajectory)
             else:
                 camera_trajectories.append(None)
@@ -207,8 +243,95 @@ class VideoStabilizationStage(PipelineStage):
 
         return {
             'videos': videos,
-            'camera_trajectories': camera_trajectories
+            'camera_trajectories': camera_trajectories,
+            'stabilization_results': stabilization_results
         }
+
+    def _incorporate_preserved_pan(
+        self,
+        trajectory,
+        preserved_pan: 'np.ndarray',
+        base_camera,
+        timestamps: torch.Tensor
+    ):
+        """
+        Incorporate preserved slow pan motion into the camera trajectory.
+
+        This ensures the fluid modeling accounts for the intentional camera motion
+        that was preserved during stabilization.
+
+        Args:
+            trajectory: CameraTrajectory from motion estimator
+            preserved_pan: Preserved pan motion (T, 3) [x, y, angle]
+            base_camera: Reference camera
+            timestamps: Frame timestamps
+
+        Returns:
+            Updated CameraTrajectory with pan motion incorporated
+        """
+        from ..calibration.camera_motion import CameraTrajectory
+        import numpy as np
+
+        n_frames = len(trajectory)
+        device = trajectory.rotations.device
+
+        # Convert 2D pan motion to 3D camera rotation/translation adjustments
+        # The preserved pan represents the intentional camera motion in image space
+        # We need to convert this to camera coordinate adjustments
+
+        updated_rotations = trajectory.rotations.clone()
+        updated_translations = trajectory.translations.clone()
+
+        for i in range(n_frames):
+            # Extract pan components
+            pan_x = preserved_pan[i, 0]  # horizontal pan (pixels)
+            pan_y = preserved_pan[i, 1]  # vertical pan (pixels)
+            pan_angle = preserved_pan[i, 2]  # rotation (radians)
+
+            # Convert pixel pan to camera rotation
+            # This is an approximation assuming small angles
+            fx = base_camera.intrinsics.fx
+            fy = base_camera.intrinsics.fy
+
+            # Angular displacement from pixel shift
+            theta_y = np.arctan2(pan_x, fx)  # horizontal pan -> rotation around Y
+            theta_x = np.arctan2(pan_y, fy)  # vertical pan -> rotation around X
+
+            # Create incremental rotation matrix for pan
+            # R_pan = R_y(theta_y) @ R_x(theta_x) @ R_z(pan_angle)
+            cy, sy = np.cos(theta_y), np.sin(theta_y)
+            cx, sx = np.cos(theta_x), np.sin(theta_x)
+            cz, sz = np.cos(pan_angle), np.sin(pan_angle)
+
+            R_y = torch.tensor([
+                [cy, 0, sy],
+                [0, 1, 0],
+                [-sy, 0, cy]
+            ], dtype=torch.float32, device=device)
+
+            R_x = torch.tensor([
+                [1, 0, 0],
+                [0, cx, -sx],
+                [0, sx, cx]
+            ], dtype=torch.float32, device=device)
+
+            R_z = torch.tensor([
+                [cz, -sz, 0],
+                [sz, cz, 0],
+                [0, 0, 1]
+            ], dtype=torch.float32, device=device)
+
+            R_pan = R_y @ R_x @ R_z
+
+            # Apply pan rotation to camera orientation
+            # This accumulates the preserved pan motion
+            updated_rotations[i] = R_pan @ updated_rotations[i]
+
+        return CameraTrajectory(
+            timestamps=trajectory.timestamps,
+            rotations=updated_rotations,
+            translations=updated_translations
+        )
 
 
 class OpticalFlowStage(PipelineStage):
@@ -229,19 +352,21 @@ class OpticalFlowStage(PipelineStage):
             video.optical_flow = estimator.compute_for_video(video)
         pbar.close()
 
-        return {'videos': videos}
+        # Preserve all input keys and update videos
+        return {**inputs, 'videos': videos}
 
 
 class FluidSegmentationStage(PipelineStage):
-    """Stage 1c: Segment fluid regions from video."""
+    """Stage 1c: Segment fluid regions from video, accounting for preserved camera pan."""
 
     name = "fluid_segmentation"
-    description = "Isolate fluid/liquid regions using motion analysis"
+    description = "Isolate fluid/liquid regions using motion analysis (pan-compensated)"
 
     def _execute(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         from ..preprocessing import FluidSegmenter
 
         videos = inputs['videos']
+        stabilization_results = inputs.get('stabilization_results', [None] * len(videos))
 
         segmenter = FluidSegmenter(
             motion_threshold=self.config.fluid_motion_threshold,
@@ -257,14 +382,21 @@ class FluidSegmentationStage(PipelineStage):
         for v_idx, video in pbar:
             pbar.set_postfix(frames=video.metadata.n_frames)
 
+            stab_result = stabilization_results[v_idx] if v_idx < len(stabilization_results) else None
+
             if video.optical_flow is None:
                 print(f"    Warning: No optical flow for video {v_idx}, skipping segmentation")
                 # Create full masks (no segmentation)
                 h, w = video.frames.shape[1:3]
                 masks = [torch.ones(h, w) for _ in range(video.metadata.n_frames)]
             else:
-                # Segment using optical flow
-                masks = segmenter.segment_from_flow(video.optical_flow, video.frames)
+                # Compensate optical flow for preserved camera pan
+                compensated_flow = self._compensate_flow_for_pan(
+                    video.optical_flow, stab_result, video.frames.shape[1:3]
+                )
+
+                # Segment using compensated optical flow
+                masks = segmenter.segment_from_flow(compensated_flow, video.frames)
 
                 # Optionally refine with appearance
                 if self.config.use_appearance_segmentation:
@@ -279,6 +411,50 @@ class FluidSegmentationStage(PipelineStage):
         pbar.close()
 
         return {**inputs, 'fluid_masks': all_fluid_masks}
+
+    def _compensate_flow_for_pan(
+        self,
+        optical_flow: torch.Tensor,
+        stab_result,
+        frame_shape: tuple
+    ) -> torch.Tensor:
+        """
+        Subtract preserved camera pan motion from optical flow.
+
+        This isolates the true fluid motion from the global camera pan that
+        was preserved during stabilization.
+
+        Args:
+            optical_flow: Optical flow tensor (T-1, H, W, 2)
+            stab_result: StabilizationResult with preserved_pan info
+            frame_shape: (H, W) of frames
+
+        Returns:
+            Pan-compensated optical flow tensor
+        """
+        if stab_result is None or not self.config.preserve_slow_pan:
+            return optical_flow
+
+        preserved_pan = stab_result.preserved_pan
+        if preserved_pan is None:
+            return optical_flow
+
+        H, W = frame_shape
+        compensated = optical_flow.clone()
+
+        # For each flow frame, subtract the global pan motion
+        for i in range(len(optical_flow)):
+            if i + 1 < len(preserved_pan):
+                # Get the pan delta between consecutive frames
+                pan_delta_x = preserved_pan[i + 1, 0] - preserved_pan[i, 0]
+                pan_delta_y = preserved_pan[i + 1, 1] - preserved_pan[i, 1]
+
+                # Subtract the global pan from optical flow
+                # This reveals the true object motion relative to the panning camera
+                compensated[i, :, :, 0] -= pan_delta_x
+                compensated[i, :, :, 1] -= pan_delta_y
+
+        return compensated
 
 
 class TemporalSyncStage(PipelineStage):

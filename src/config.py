@@ -243,6 +243,17 @@ class PipelineConfig:
     track_camera_motion: bool = True   # Track per-frame camera poses
     stabilization_smoothing: int = 30  # Temporal smoothing radius for stabilization
 
+    # Slow pan stabilization (preserves intentional camera motion)
+    preserve_slow_pan: bool = True  # Separate shake from slow pans
+    shake_frequency_cutoff: float = 2.0  # Hz - motion above this is considered shake
+    min_pan_velocity: float = 0.5  # pixels/frame - minimum motion to consider as pan
+    pan_smoothness_factor: float = 0.8  # How much to preserve pan (0=remove all, 1=keep all)
+
+    # Frame timing for stabilization
+    stabilization_start_frame: Optional[int] = None  # Start frame for stabilization (None=auto)
+    stabilization_end_frame: Optional[int] = None  # End frame for stabilization (None=auto)
+    stabilization_edge_taper: int = 10  # Frames to taper stabilization at edges
+
     # Fluid segmentation
     fluid_motion_threshold: float = 2.0  # Optical flow magnitude threshold for fluid
     use_appearance_segmentation: bool = True  # Use color/appearance to refine masks

@@ -8,6 +8,7 @@ from .camera_motion import (
     CameraTrajectory,
     CameraMotionEstimator,
     VideoStabilizer,
+    StabilizationResult,
     compensate_shake_in_triangulation
 )
 
@@ -24,5 +25,6 @@ __all__ = [
     "CameraTrajectory",
     "CameraMotionEstimator",
     "VideoStabilizer",
+    "StabilizationResult",
     "compensate_shake_in_triangulation",
 ]

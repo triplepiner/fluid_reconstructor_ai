@@ -339,27 +339,60 @@ class CameraMotionEstimator:
         return rotations_smooth, translations_smooth
 
 
+@dataclass
+class StabilizationResult:
+    """Result from video stabilization."""
+    stabilized_frames: torch.Tensor  # (T, H, W, 3) stabilized frames
+    original_transforms: List[np.ndarray]  # Per-frame transforms
+    raw_trajectory: np.ndarray  # (T, 3) raw trajectory [x, y, angle]
+    smoothed_trajectory: np.ndarray  # (T, 3) smoothed trajectory
+    preserved_pan: np.ndarray  # (T, 3) preserved slow pan motion
+    shake_removed: np.ndarray  # (T, 3) high-frequency shake that was removed
+
+
 class VideoStabilizer:
     """
-    Stabilize video by removing camera shake.
+    Stabilize video by removing camera shake while preserving slow pans.
 
-    Estimates camera motion and warps frames to a stable reference.
+    Uses frequency-based separation to distinguish intentional camera motion
+    (slow pans) from high-frequency shake.
     """
 
     def __init__(
         self,
         smoothing_radius: int = 30,
-        border_mode: str = "replicate"
+        border_mode: str = "replicate",
+        preserve_slow_pan: bool = True,
+        shake_frequency_cutoff: float = 2.0,
+        min_pan_velocity: float = 0.5,
+        pan_smoothness_factor: float = 0.8,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None,
+        edge_taper: int = 10
     ):
         """
-        Initialize video stabilizer.
+        Initialize video stabilizer with slow pan preservation.
 
         Args:
-            smoothing_radius: Temporal smoothing radius
+            smoothing_radius: Temporal smoothing radius for basic smoothing
             border_mode: How to handle frame borders after warping
+            preserve_slow_pan: Whether to preserve slow intentional pans
+            shake_frequency_cutoff: Frequency (Hz) above which motion is shake
+            min_pan_velocity: Minimum velocity to consider as pan (pixels/frame)
+            pan_smoothness_factor: How much to preserve pan (0=remove, 1=keep)
+            start_frame: Start frame for stabilization (None=0)
+            end_frame: End frame for stabilization (None=last)
+            edge_taper: Frames to taper stabilization at edges
         """
         self.smoothing_radius = smoothing_radius
         self.border_mode = border_mode
+        self.preserve_slow_pan = preserve_slow_pan
+        self.shake_frequency_cutoff = shake_frequency_cutoff
+        self.min_pan_velocity = min_pan_velocity
+        self.pan_smoothness_factor = pan_smoothness_factor
+        self.start_frame = start_frame
+        self.end_frame = end_frame
+        self.edge_taper = edge_taper
 
         self.border_modes = {
             "replicate": cv2.BORDER_REPLICATE,
@@ -369,18 +402,26 @@ class VideoStabilizer:
 
     def stabilize(
         self,
-        frames: torch.Tensor
+        frames: torch.Tensor,
+        fps: float = 30.0
     ) -> Tuple[torch.Tensor, List[np.ndarray]]:
         """
-        Stabilize video frames.
+        Stabilize video frames while preserving slow camera pans.
 
         Args:
             frames: Video frames (T, H, W, 3)
+            fps: Frame rate for frequency calculations
 
         Returns:
             Tuple of (stabilized frames, original transforms)
         """
         n_frames, H, W = frames.shape[:3]
+
+        # Determine frame range for stabilization
+        start = self.start_frame if self.start_frame is not None else 0
+        end = self.end_frame if self.end_frame is not None else n_frames
+        start = max(0, min(start, n_frames - 1))
+        end = max(start + 1, min(end, n_frames))
 
         # Track features
         transforms = []
@@ -435,11 +476,21 @@ class VideoStabilizer:
 
             trajectory[i + 1] = trajectory[i] + [dx, dy, da]
 
-        # Smooth trajectory
-        smoothed = self._smooth_trajectory_1d(trajectory)
+        # Separate slow pan from shake using frequency-based filtering
+        if self.preserve_slow_pan:
+            smoothed, preserved_pan, shake = self._separate_pan_and_shake(
+                trajectory, fps
+            )
+        else:
+            smoothed = self._smooth_trajectory_1d(trajectory)
+            preserved_pan = np.zeros_like(trajectory)
+            shake = trajectory - smoothed
 
-        # Compute corrective transforms
+        # Compute corrective transforms (only remove shake, preserve pan)
         difference = smoothed - trajectory
+
+        # Apply edge tapering for start/end frames
+        difference = self._apply_edge_taper(difference, start, end, n_frames)
 
         # Apply stabilization
         stabilized = torch.zeros_like(frames)
@@ -469,6 +520,247 @@ class VideoStabilizer:
             stabilized[i] = torch.from_numpy(warped.astype(np.float32) / 255.0)
 
         return stabilized, transforms
+
+    def stabilize_with_details(
+        self,
+        frames: torch.Tensor,
+        fps: float = 30.0
+    ) -> StabilizationResult:
+        """
+        Stabilize with full trajectory details for camera motion tracking.
+
+        Args:
+            frames: Video frames (T, H, W, 3)
+            fps: Frame rate for frequency calculations
+
+        Returns:
+            StabilizationResult with all trajectory information
+        """
+        n_frames, H, W = frames.shape[:3]
+
+        # Determine frame range
+        start = self.start_frame if self.start_frame is not None else 0
+        end = self.end_frame if self.end_frame is not None else n_frames
+        start = max(0, min(start, n_frames - 1))
+        end = max(start + 1, min(end, n_frames))
+
+        # Track features
+        transforms = []
+        prev_gray = self._to_gray(frames[0])
+
+        for i in range(1, n_frames):
+            curr_gray = self._to_gray(frames[i])
+            prev_pts = cv2.goodFeaturesToTrack(
+                prev_gray, maxCorners=200, qualityLevel=0.01, minDistance=30
+            )
+
+            if prev_pts is None:
+                transforms.append(np.eye(2, 3, dtype=np.float32))
+            else:
+                curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                    prev_gray, curr_gray, prev_pts, None
+                )
+                valid = status.flatten() == 1
+                prev_valid = prev_pts[valid]
+                curr_valid = curr_pts[valid]
+
+                if len(prev_valid) < 4:
+                    transforms.append(np.eye(2, 3, dtype=np.float32))
+                else:
+                    T, _ = cv2.estimateAffine2D(prev_valid, curr_valid, method=cv2.RANSAC)
+                    if T is None:
+                        T = np.eye(2, 3, dtype=np.float32)
+                    transforms.append(T)
+
+            prev_gray = curr_gray
+
+        # Build trajectory
+        trajectory = np.zeros((n_frames, 3))
+        for i, T in enumerate(transforms):
+            dx, dy = T[0, 2], T[1, 2]
+            da = np.arctan2(T[1, 0], T[0, 0])
+            trajectory[i + 1] = trajectory[i] + [dx, dy, da]
+
+        # Separate pan and shake
+        if self.preserve_slow_pan:
+            smoothed, preserved_pan, shake = self._separate_pan_and_shake(trajectory, fps)
+        else:
+            smoothed = self._smooth_trajectory_1d(trajectory)
+            preserved_pan = np.zeros_like(trajectory)
+            shake = trajectory - smoothed
+
+        # Compute and apply correction
+        difference = smoothed - trajectory
+        difference = self._apply_edge_taper(difference, start, end, n_frames)
+
+        stabilized = torch.zeros_like(frames)
+        stabilized[0] = frames[0]
+
+        for i in range(1, n_frames):
+            dx, dy, da = difference[i]
+            T_correct = np.array([
+                [np.cos(da), -np.sin(da), dx],
+                [np.sin(da), np.cos(da), dy]
+            ], dtype=np.float32)
+
+            frame_np = frames[i].cpu().numpy()
+            if frame_np.max() <= 1.0:
+                frame_np = (frame_np * 255).astype(np.uint8)
+
+            warped = cv2.warpAffine(
+                frame_np, T_correct, (W, H),
+                borderMode=self.border_modes.get(self.border_mode, cv2.BORDER_REPLICATE)
+            )
+            stabilized[i] = torch.from_numpy(warped.astype(np.float32) / 255.0)
+
+        return StabilizationResult(
+            stabilized_frames=stabilized,
+            original_transforms=transforms,
+            raw_trajectory=trajectory,
+            smoothed_trajectory=smoothed,
+            preserved_pan=preserved_pan,
+            shake_removed=shake
+        )
+
+    def _separate_pan_and_shake(
+        self,
+        trajectory: np.ndarray,
+        fps: float
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Separate slow camera pan from high-frequency shake.
+
+        Uses a low-pass filter to extract slow motion (pan) and treats
+        the residual as shake to be removed.
+
+        Args:
+            trajectory: Raw trajectory (T, 3) [x, y, angle]
+            fps: Video frame rate
+
+        Returns:
+            Tuple of (smoothed_trajectory, preserved_pan, shake)
+        """
+        n_frames = len(trajectory)
+
+        # Design low-pass filter for pan extraction
+        # Nyquist frequency
+        nyquist = fps / 2.0
+        # Normalized cutoff frequency
+        cutoff_normalized = min(self.shake_frequency_cutoff / nyquist, 0.99)
+
+        # Create butterworth low-pass filter coefficients
+        try:
+            from scipy.signal import butter, filtfilt
+            b, a = butter(2, cutoff_normalized, btype='low')
+
+            # Apply filter to extract low-frequency pan motion
+            pan_motion = np.zeros_like(trajectory)
+            for dim in range(3):
+                # Pad signal to reduce edge effects
+                padded = np.pad(trajectory[:, dim], (n_frames // 4, n_frames // 4), mode='reflect')
+                filtered = filtfilt(b, a, padded)
+                # Remove padding
+                pan_motion[:, dim] = filtered[n_frames // 4: -n_frames // 4 if n_frames // 4 > 0 else None]
+        except ImportError:
+            # Fallback: use moving average with larger window
+            pan_motion = self._extract_pan_moving_average(trajectory, fps)
+
+        # Detect if there's significant pan motion
+        pan_velocity = np.diff(pan_motion, axis=0)
+        pan_speed = np.sqrt(pan_velocity[:, 0]**2 + pan_velocity[:, 1]**2)
+        has_significant_pan = np.median(pan_speed) > self.min_pan_velocity
+
+        # Compute shake as residual
+        shake = trajectory - pan_motion
+
+        if has_significant_pan:
+            # Preserve pan motion, only smooth shake
+            # Apply pan_smoothness_factor to control how much pan is preserved
+            preserved_pan = pan_motion * self.pan_smoothness_factor
+            # The target trajectory preserves pan but removes shake
+            smoothed = preserved_pan
+        else:
+            # No significant pan detected - use standard smoothing
+            smoothed = self._smooth_trajectory_1d(trajectory)
+            preserved_pan = np.zeros_like(trajectory)
+            shake = trajectory - smoothed
+
+        return smoothed, preserved_pan, shake
+
+    def _extract_pan_moving_average(
+        self,
+        trajectory: np.ndarray,
+        fps: float
+    ) -> np.ndarray:
+        """
+        Extract pan using moving average (fallback when scipy not available).
+
+        Uses a larger window to capture slow motion.
+        """
+        # Window size based on cutoff frequency
+        # Lower cutoff = larger window
+        window_size = int(fps / self.shake_frequency_cutoff)
+        window_size = max(3, window_size)
+        if window_size % 2 == 0:
+            window_size += 1
+
+        half_w = window_size // 2
+        n_frames = len(trajectory)
+        pan_motion = np.zeros_like(trajectory)
+
+        for dim in range(3):
+            for i in range(n_frames):
+                start = max(0, i - half_w)
+                end = min(n_frames, i + half_w + 1)
+                pan_motion[i, dim] = trajectory[start:end, dim].mean()
+
+        return pan_motion
+
+    def _apply_edge_taper(
+        self,
+        difference: np.ndarray,
+        start: int,
+        end: int,
+        n_frames: int
+    ) -> np.ndarray:
+        """
+        Apply tapering at edges to avoid sudden jumps at start/end frames.
+
+        Args:
+            difference: Correction to apply (T, 3)
+            start: Start frame for stabilization
+            end: End frame for stabilization
+            n_frames: Total number of frames
+
+        Returns:
+            Tapered correction array
+        """
+        tapered = difference.copy()
+
+        # Zero out correction before start frame
+        tapered[:start] = 0
+
+        # Zero out correction after end frame
+        tapered[end:] = 0
+
+        # Apply taper at start
+        taper_start = min(self.edge_taper, (end - start) // 4)
+        for i in range(start, min(start + taper_start, end)):
+            # Smooth ramp from 0 to 1
+            t = (i - start) / max(taper_start, 1)
+            # Use smooth step function
+            weight = t * t * (3 - 2 * t)
+            tapered[i] *= weight
+
+        # Apply taper at end
+        taper_end = min(self.edge_taper, (end - start) // 4)
+        for i in range(max(start, end - taper_end), end):
+            # Smooth ramp from 1 to 0
+            t = (end - 1 - i) / max(taper_end, 1)
+            weight = t * t * (3 - 2 * t)
+            tapered[i] *= weight
+
+        return tapered
 
     def _to_gray(self, frame: torch.Tensor) -> np.ndarray:
         """Convert to grayscale uint8."""
