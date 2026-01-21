@@ -1,22 +1,32 @@
 # Physics-Integrated Neural Fluid Reconstruction
 
-Reconstruct 3D fluid dynamics from multi-view video using 3D Gaussian Splatting with Navier-Stokes physics constraints.
+Reconstruct 3D fluid dynamics from multi-view video using **3D Gaussian Splatting** combined with **Navier-Stokes physics constraints**. This system takes 1-3 videos of fluid motion and outputs a complete 3D reconstruction with estimated velocity, pressure, density, and viscosity fields.
 
-## Features
+## What This Project Does
 
-- **Flexible input** - Works with 1-3 videos (single video uses monocular depth estimation)
-- **Multi-view support** - Handle videos with different FPS, resolutions, start times
-- **Automatic synchronization** - Align videos using motion signatures (0.3-3s offset detection)
-- **Camera shake compensation** - Video stabilization + per-frame motion tracking
-- **Camera calibration** - Automatic intrinsics/extrinsics estimation from feature matching
-- **3D Gaussian Splatting** - Dynamic scene reconstruction with time-varying Gaussians
-- **Physics estimation** - Velocity, pressure, density, and viscosity fields
-- **Navier-Stokes constraints** - PINN-style physics-informed optimization
+Given video footage of fluids (water, smoke, etc.), this pipeline:
+
+1. **Synchronizes** videos recorded at different times (handles 0.3-3s offsets)
+2. **Calibrates cameras** automatically from feature matching
+3. **Reconstructs** the scene using dynamic 3D Gaussian Splatting
+4. **Estimates physics** - velocity field **u(x,t)**, pressure **p(x,t)**, density **ρ(x,t)**, and viscosity **ν**
+
+The output enables novel view synthesis, physics-based simulation, and fluid analysis.
+
+## Key Features
+
+- **Flexible Input**: 1-3 videos with different FPS, resolutions, and zoom levels
+- **Automatic Synchronization**: Aligns videos using motion signature cross-correlation
+- **Camera Shake Compensation**: Frequency-based separation of shake from intentional pans
+- **Physics-Informed**: PINN-style Navier-Stokes constraints ensure physical plausibility
+- **Fast Rendering**: Gaussian splatting enables real-time novel-view synthesis
+- **Cross-Platform**: NVIDIA GPU (CUDA), Apple Silicon (MPS), and CPU support
 
 ## Installation
 
 ```bash
 # Clone the repository
+git clone https://github.com/yourusername/fluid_ai.git
 cd fluid_ai
 
 # Create virtual environment (recommended)
@@ -32,38 +42,27 @@ pip install -r requirements.txt
 
 - Python 3.9+
 - PyTorch 2.0+
-- NVIDIA GPU with CUDA (recommended for best performance)
-- Also works on: Apple Silicon Mac (MPS), or CPU (slower)
+- NVIDIA GPU with CUDA (recommended) / Apple Silicon (MPS) / CPU
 
 ## Quick Start
 
-### Single Video (Easiest)
-
 ```bash
-# Just one video - uses AI depth estimation
+# Single video (uses depth estimation)
 python scripts/run_pipeline.py my_fluid_video.mp4
-```
 
-### Multi-View (Best Quality)
-
-```bash
-# 2-3 videos from different angles
+# Multi-view (best quality)
 python scripts/run_pipeline.py front.mp4 left.mp4 right.mp4
-```
 
-### Interactive Mode
-
-```bash
+# Interactive mode (GUI file selector)
 python scripts/run_pipeline.py
+
+# With options
+python scripts/run_pipeline.py video.mp4 --output ./results --epochs 10000 --device cuda
 ```
 
-Opens a file dialog to select video files.
+### Command Line Options
 
-### All Options
-
-```bash
-python scripts/run_pipeline.py --help
-
+```
 Options:
   videos              Input video files (1-3 videos)
   -o, --output        Output directory (default: outputs)
@@ -73,80 +72,154 @@ Options:
   --no-physics        Skip physics estimation stage
   --resume            Resume from checkpoint directory
   --test              Run quick test with reduced settings
-  --interactive       Force interactive mode
 ```
 
-### Device Support
-
-| Device | Description | Performance |
-|--------|-------------|-------------|
-| `auto` | Auto-detect best available (default) | - |
-| `cuda` | NVIDIA GPU with CUDA | Fastest |
-| `mps` | Apple Silicon Mac (M1/M2/M3) | Fast |
-| `cpu` | Any CPU | Slower |
-
-For Mac users without NVIDIA GPU, the pipeline auto-detects and uses CPU.
-Use `--max-resolution 480` for faster CPU processing.
-
-### Quality Comparison
-
-| Mode | Input | 3D Quality | Physics Accuracy |
-|------|-------|------------|------------------|
-| Single video | 1 video | Good | Good |
-| Stereo | 2 videos | Better | Better |
-| Multi-view | 3 videos | Best | Best |
-
-## Recording Videos
-
-For best results when capturing fluid:
-
-1. **Use 3 cameras** - Place at different angles (ideally 60-120° apart)
-2. **Same scene** - All cameras must see the same fluid motion
-3. **Stable mounting** - Use tripods if possible (shake compensation helps but isn't perfect)
-4. **Good lighting** - Consistent lighting across all views
-5. **Start recording** - Start all cameras within 3 seconds of each other
-6. **Frame rate** - Higher is better (60fps recommended), but different rates are OK
-
-### Example Setup
+## Architecture
 
 ```
-        Camera 1 (front)
-             |
-             v
-    [===================]
-    [                   ]
-    [      FLUID        ]
-    [                   ]
-    [===================]
-   /                     \
-  v                       v
-Camera 2              Camera 3
-(left 60°)           (right 60°)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        PREPROCESSING                                         │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐                  │
+│  │  Video   │──▶│  Stabi-  │──▶│ Optical  │──▶│  Fluid   │                  │
+│  │  Loader  │   │  lizer   │   │   Flow   │   │Segmenter │                  │
+│  └──────────┘   └──────────┘   └──────────┘   └──────────┘                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        SYNCHRONIZATION                                       │
+│  ┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐         │
+│  │ Motion Signature │──▶│ Cross-Correlation│──▶│ Frame Interp.    │         │
+│  │    Extraction    │   │  (find offset)   │   │ (align timeline) │         │
+│  └──────────────────┘   └──────────────────┘   └──────────────────┘         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        CAMERA CALIBRATION                                    │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐                     │
+│  │   Feature    │──▶│   Feature    │──▶│   Bundle     │                     │
+│  │  Extraction  │   │   Matching   │   │  Adjustment  │                     │
+│  └──────────────┘   └──────────────┘   └──────────────┘                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     3D GAUSSIAN SPLATTING                                    │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐                     │
+│  │Triangulation │──▶│  Gaussian    │──▶│  Dynamic     │                     │
+│  │ (3D points)  │   │    Init      │   │ Optimization │                     │
+│  └──────────────┘   └──────────────┘   └──────────────┘                     │
+│                                              │                               │
+│                     Loss = L_photo + L_temporal + L_flow + L_physics         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     PHYSICS ESTIMATION (PINN)                                │
+│  ┌──────────────────────────────────────────────────────────────────┐       │
+│  │              Neural Fields: MLP with Positional Encoding          │       │
+│  │                                                                   │       │
+│  │  Input: (x, y, z, t) ──▶ [sin/cos encoding] ──▶ MLP ──▶ (u, p, ρ)│       │
+│  └──────────────────────────────────────────────────────────────────┘       │
+│                                                                              │
+│  Navier-Stokes Loss:                                                        │
+│  • Momentum: ∂u/∂t + (u·∇)u = -∇p/ρ + ν∇²u                                  │
+│  • Continuity: ∇·u = 0 (incompressibility)                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Pipeline Stages
+## Core Components
 
-1. **Video Loading** - Load and validate input videos
-2. **Stabilization** - Remove camera shake, track residual motion
-3. **Optical Flow** - Compute dense motion between frames
-4. **Temporal Sync** - Align video timelines using motion correlation
-5. **Feature Extraction** - Detect keypoints (SuperPoint/SIFT)
-6. **Camera Calibration** - Estimate camera poses from matches
-7. **Triangulation** - Build initial 3D point cloud
-8. **Gaussian Init** - Initialize 3D Gaussians from point cloud
-9. **Reconstruction** - Optimize Gaussians with photometric loss
-10. **Physics Estimation** - Estimate velocity, pressure, density, viscosity
-11. **Output** - Save results (Gaussians, fields, visualizations)
+### Preprocessing (`src/preprocessing/`)
+
+| Component | Purpose |
+|-----------|---------|
+| `VideoLoader` | Loads videos (mp4, avi, mov, mkv), handles different resolutions/FPS |
+| `OpticalFlowEstimator` | Dense optical flow using RAFT between consecutive frames |
+| `FeatureExtractor` | Keypoint detection (SuperPoint/SIFT) for camera calibration |
+| `FluidSegmenter` | Isolates fluid regions from background |
+| `DepthEstimator` | Monocular depth for single-view mode |
+
+### Synchronization (`src/synchronization/`)
+
+| Component | Purpose |
+|-----------|---------|
+| `TemporalAligner` | Aligns videos using cross-correlation of motion signatures |
+| `MotionSignatureAnalyzer` | Computes motion energy, direction, spatial variance per frame |
+| `FrameInterpolator` | Sub-frame interpolation to common timeline |
+
+### Camera Calibration (`src/calibration/`)
+
+| Component | Purpose |
+|-----------|---------|
+| `CameraEstimator` | Estimates intrinsics (focal length, principal point, distortion) |
+| `FeatureMatcher` | Matches features across views (SIFT or SuperGlue) |
+| `BundleAdjuster` | Joint optimization minimizing reprojection error |
+| `Triangulation` | Reconstructs 3D points from 2D matches |
+
+### 3D Gaussian Splatting (`src/gaussian_splatting/`)
+
+| Component | Purpose |
+|-----------|---------|
+| `GaussianCloud` | Scene as 3D Gaussians: position μ, covariance Σ, opacity α, color (SH) |
+| `DynamicGaussians` | Time-varying Gaussians with velocity-based motion |
+| `Rasterizer` | Differentiable splatting renderer |
+| `GaussianLoss` | Multi-view photometric loss (L1 + SSIM) |
+
+### Physics (`src/physics/`)
+
+| Component | Purpose |
+|-----------|---------|
+| `NavierStokesLoss` | PINN losses enforcing momentum and continuity equations |
+| `NeuralFields` | MLPs with positional encoding for continuous field representation |
+| `ViscosityEstimator` | Estimates kinematic viscosity from velocity diffusion |
+| `FieldsData` | Storage for velocity, pressure, density fields |
+
+## Key Algorithms
+
+### 1. Motion Signature Cross-Correlation (Temporal Sync)
+
+```python
+# For each video, compute motion signature per frame:
+signature = [flow_magnitude, flow_direction, spatial_variance]
+
+# Cross-correlate signatures between video pairs
+correlation = scipy.signal.correlate(sig_A, sig_B)
+offset = argmax(correlation)  # with parabolic refinement
+```
+
+### 2. Slow Pan Stabilization
+
+Separates intentional camera motion from unwanted shake using frequency analysis:
+- High-frequency (>2 Hz) = camera shake → remove
+- Low-frequency (<2 Hz) = intentional pan → preserve
+
+### 3. Dynamic 3D Gaussian Splatting
+
+Each Gaussian has parameters: `{μ, Σ, α, color_SH, velocity}`
+
+Three temporal modes:
+- **Per-frame**: Independent Gaussians per timestep
+- **Trajectory**: Base Gaussians + learned time offsets
+- **Velocity**: Base Gaussians with predicted velocities (best for fluids)
+
+### 4. Physics-Informed Neural Networks (PINNs)
+
+Neural fields predict `(u, p, ρ)` from `(x, y, z, t)` with positional encoding:
+```
+γ(p) = [sin(2⁰πp), cos(2⁰πp), ..., sin(2^(L-1)πp), cos(2^(L-1)πp)]
+```
+
+Loss includes Navier-Stokes residuals computed via automatic differentiation.
 
 ## Output Files
 
-After running, find results in `outputs/`:
-
 ```
 outputs/
-├── checkpoints/           # Training checkpoints
+├── checkpoints/           # Training checkpoints (resume capability)
 │   └── epoch_XXXX.pt
-├── gaussians/             # Reconstructed Gaussians
+├── gaussians/             # Reconstructed 3D Gaussians
 │   ├── gaussians.pt       # PyTorch model
 │   └── gaussians.ply      # Point cloud export
 ├── fields/                # Physics fields
@@ -157,49 +230,18 @@ outputs/
 ├── videos/                # Rendered outputs
 │   ├── reconstruction.mp4
 │   └── novel_views.mp4
-└── calibration/           # Camera parameters
-    └── cameras.json
+└── calibration/
+    └── cameras.json       # Camera parameters
 ```
 
-## Configuration
+## Physics Outputs
 
-Edit parameters in code or pass via command line:
-
-```python
-from src.config import PipelineConfig
-
-config = PipelineConfig(
-    # Hardware
-    device="cuda",
-    mixed_precision=True,
-
-    # Video processing
-    max_resolution=1080,
-    enable_stabilization=True,      # Remove camera shake
-    track_camera_motion=True,       # Track per-frame poses
-
-    # Synchronization
-    max_offset_seconds=3.0,         # Max time offset between videos
-
-    # Gaussian Splatting
-    initial_n_gaussians=100_000,
-    max_n_gaussians=500_000,
-    sh_degree=3,                    # Spherical harmonics degree
-
-    # Training
-    optimization=OptimizationConfig(
-        n_epochs=10000,
-        lr_position=1e-4,
-        lr_color=2.5e-3,
-    ),
-
-    # Physics
-    physics=PhysicsConfig(
-        gravity=(0.0, -9.81, 0.0),
-        reference_density=1000.0,   # kg/m³ (water)
-    ),
-)
-```
+| Field | Description | Units |
+|-------|-------------|-------|
+| **Velocity** u(x,t) | 3D vector field of fluid motion | m/s |
+| **Pressure** p(x,t) | Scalar pressure distribution | Pa |
+| **Density** ρ(x,t) | Scalar density from Gaussian opacity | relative |
+| **Viscosity** ν | Kinematic viscosity (identifies fluid type) | m²/s |
 
 ## Python API
 
@@ -209,69 +251,56 @@ from src.config import PipelineConfig
 from src.pipeline import FluidReconstructionPipeline
 
 # Create pipeline
-config = PipelineConfig(device="cuda", output_dir=Path("my_outputs"))
+config = PipelineConfig(
+    device="cuda",
+    output_dir=Path("my_outputs"),
+    max_resolution=1080,
+    optimization={'n_epochs': 10000}
+)
 pipeline = FluidReconstructionPipeline(config)
 
 # Run on videos
 videos = [Path("view1.mp4"), Path("view2.mp4"), Path("view3.mp4")]
 result = pipeline.run(videos)
 
-# Check results
+# Access outputs
 if result.success:
-    print(f"Reconstruction complete in {result.total_duration:.1f}s")
-
-    # Access outputs
-    gaussians = result.outputs.get('gaussians')
-    velocity_field = result.outputs.get('velocity_field')
-    viscosity = result.outputs.get('viscosity_estimate')
+    gaussians = result.outputs['gaussians']
+    velocity_field = result.outputs['velocity_field']
+    viscosity = result.outputs['viscosity_estimate']
 ```
 
-## Physics Outputs
+## Recording Tips
 
-The pipeline estimates physical properties of the fluid:
+For best results when capturing fluid:
 
-### Velocity Field `u(x, t)`
-- 3D vector field representing fluid motion
-- Units: m/s (in reconstructed coordinate system)
+1. **Use 3 cameras** at 60-120° angles apart
+2. **Stable mounting** (tripods recommended)
+3. **Good lighting** consistent across views
+4. **Start within 3 seconds** of each other
+5. **60fps recommended** (different rates OK)
 
-### Pressure Field `p(x, t)`
-- Scalar field representing pressure distribution
-- Estimated via Navier-Stokes constraints
-
-### Density Field `ρ(x, t)`
-- Scalar field from Gaussian opacity aggregation
-- Relative density (normalized)
-
-### Viscosity `ν`
-- Kinematic viscosity estimated from velocity diffusion
-- Can identify fluid type (water ~0.001, honey ~2.0 Pa·s)
+```
+        Camera 1 (front)
+             |
+             v
+    [===================]
+    [      FLUID        ]
+    [===================]
+   /                     \
+  v                       v
+Camera 2              Camera 3
+(left 60°)           (right 60°)
+```
 
 ## Troubleshooting
 
-### Out of Memory
-```bash
-# Reduce resolution
-python scripts/run_pipeline.py videos/*.mp4 --max-resolution 720
-
-# Or reduce Gaussians in config
-config.initial_n_gaussians = 50000
-config.max_n_gaussians = 200000
-```
-
-### Poor Synchronization
-- Ensure videos show the same motion event
-- Check that offset is within 0.3-3 seconds
-- Try increasing `max_offset_seconds` if needed
-
-### Camera Calibration Fails
-- Need sufficient texture/features in scene
-- Ensure cameras have overlapping views
-- Try different camera angles (not too parallel)
-
-### Blurry Reconstruction
-- Increase training epochs: `--epochs 10000`
-- Check input video quality
-- Ensure cameras are stable during capture
+| Problem | Solution |
+|---------|----------|
+| Out of memory | `--max-resolution 720` or reduce `initial_n_gaussians` |
+| Poor sync | Ensure videos show same event, check offset is <3s |
+| Calibration fails | Need texture/features, ensure overlapping views |
+| Blurry output | Increase `--epochs 10000`, check input quality |
 
 ## Project Structure
 
@@ -287,14 +316,32 @@ fluid_ai/
 │   ├── pipeline/                 # Stage orchestration
 │   └── ui/                       # File selection, progress
 ├── scripts/
-│   └── run_pipeline.py           # Main entry point
-├── outputs/                      # Default output directory
+│   ├── run_pipeline.py           # Main entry point
+│   ├── visualize_output.py       # Render results
+│   └── visualize_dynamic.py      # Animate Gaussians
+├── goals/                        # Project specification docs
 ├── requirements.txt
 └── README.md
 ```
 
+## Technical Highlights
+
+- **100K-500K Gaussians** with efficient splatting
+- **Automatic differentiation** for physics constraints
+- **Mixed precision training** for memory efficiency
+- **Checkpoint/resume** capability for long training runs
+- **Modular design** - each stage can run independently
+
 ## Citation
 
+```bibtex
+@misc{fluid_reconstruction_2024,
+  title={Physics-Integrated Neural Fluid Reconstruction},
+  author={MBZUAI Research Team},
+  year={2024},
+  publisher={GitHub},
+}
+```
 
 ## License
 
