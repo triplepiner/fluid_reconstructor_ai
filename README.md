@@ -335,14 +335,14 @@ fluid_ai/
 ## Citation
 
 ```bibtex
-@misc{fluid_reconstruction_2024,
+@misc{fluid_reconstruction_2026,
   title={Physics-Integrated Neural Fluid Reconstruction},
-  author={MBZUAI Research Team},
-  year={2024},
+  author={Makar Ulesov},
+  year={2026},
   publisher={GitHub},
 }
 ```
 
 ## License
 
-MIT License - see LICENSE file for details.
+All rights reserved. No copying permitted without explicit permission from the author.
